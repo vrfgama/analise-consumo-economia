@@ -1,0 +1,27 @@
+# ---- Arquivos e pastas do Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.env
+
+# ---- Docker ----
+# Pastas de volumes e dados persistidos
+postgres-data/
+postgres-db-volume/
+airflow/logs/
+airflow/tmp/
+airflow/dags/__pycache__/
+
+# ---- Arquivos do sistema ----
+.DS_Store
+Thumbs.db
+
+# ---- IDEs e editores ----
+.vscode/
+.idea/
+
+# ---- Outros ----
+*.log
