@@ -64,6 +64,7 @@ services:
     networks:
       - airflow_network
 
+
   airflow-scheduler:
     image: apache/airflow:2.9.1-python3.12
     restart: always
@@ -84,6 +85,7 @@ services:
       - ./data:/opt/airflow/data
     networks:
       - airflow_network
+
 
 volumes:
   postgres-db-volume:
