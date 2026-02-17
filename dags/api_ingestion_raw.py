@@ -164,6 +164,219 @@ def extract_api_raw(**context):
     logging.info("Ingestão RAW finalizada com sucesso.")
 
 
+import os
+import json
+import logging
+from datetime import datetime
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+
+def process_raw_indicator_files():
+
+    hook = PostgresHook(postgres_conn_id="postgres_default")
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+
+    base_path = "/opt/airflow/data/raw"
+
+    logging.info("Iniciando varredura de arquivos raw...")
+
+    for root, dirs, files in os.walk(base_path):
+        for file in files:
+
+            if not file.endswith(".json"):
+                continue
+
+            file_path = os.path.join(root, file)
+            logging.info(f"Processando arquivo: {file_path}")
+
+            # -------------------------------------------------
+            # 🔎 Verifica se existe log com success = true
+            # -------------------------------------------------
+            cursor.execute("""
+                SELECT 1
+                FROM logs.api_ingestion_log
+                WHERE file_name = %s
+                  AND status = 'SUCCESS'
+                LIMIT 1
+            """, (file,))
+
+            log_ok = cursor.fetchone()
+
+            if not log_ok:
+                logging.info(f"Arquivo {file} ignorado (sem success no log).")
+                continue
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # ==========================================================
+            # IBGE (estrutura com "resultados")
+            # ==========================================================
+
+            if isinstance(data, list) and len(data) > 0 and "resultados" in data[0]:
+
+                parts = file.replace(".json", "").split("_")
+
+                aggregate_code = None
+                variable_code = None
+
+                for part in parts:
+                    if part.startswith("ag") and part[2:].isdigit():
+                        aggregate_code = part[2:]
+                    if part.startswith("var") and part[3:].isdigit():
+                        variable_code = part[3:]
+
+                if not aggregate_code or not variable_code:
+                    logging.warning(f"Códigos IBGE inválidos no arquivo {file}")
+                    continue
+
+                resultados = data[0]["resultados"]
+
+                # ======================================================
+                # 🔵 CASO 3418 (COM CATEGORY)
+                # ======================================================
+                if aggregate_code == "3418":
+
+                    for resultado in resultados:
+
+                        category_code = None
+
+                        for classificacao in resultado.get("classificacoes", []):
+                            categoria = classificacao.get("categoria", {})
+                            if isinstance(categoria, dict) and categoria:
+                                category_code = list(categoria.keys())[0]
+
+                        if not category_code:
+                            continue
+
+                        cursor.execute("""
+                            SELECT id
+                            FROM staging.d_indicator_metadata
+                            WHERE aggregate_code = %s
+                            AND variable_code = %s
+                            AND category_code = %s
+                        """, (int(aggregate_code), int(variable_code), int(category_code)))
+
+                        result = cursor.fetchone()
+                        if not result:
+                            continue
+
+                        indicator_id = result[0]
+
+                        for serie in resultado["series"]:
+                            for ref, val in serie["serie"].items():
+
+                                if val == "-" or val is None:
+                                    continue
+
+                                reference_date = datetime.strptime(ref, "%Y%m").date()
+                                value = float(val.replace(",", "."))
+
+                                cursor.execute("""
+                                    INSERT INTO staging.f_indicator_value
+                                    (indicator_id, reference_date, value)
+                                    VALUES (%s, %s, %s)
+                                    ON CONFLICT (indicator_id, reference_date)
+                                    DO UPDATE SET value = EXCLUDED.value
+                                """, (indicator_id, reference_date, value))
+
+                # ======================================================
+                # 🟢 OUTROS IBGE (3416, 6381 etc.)
+                # ======================================================
+                else:
+
+                    cursor.execute("""
+                        SELECT id
+                        FROM staging.d_indicator_metadata
+                        WHERE aggregate_code = %s
+                        AND variable_code = %s
+                        AND category_code IS NULL
+                    """, (int(aggregate_code), int(variable_code)))
+
+                    result = cursor.fetchone()
+                    if not result:
+                        continue
+
+                    indicator_id = result[0]
+
+                    for resultado in resultados:
+                        for serie in resultado["series"]:
+                            for ref, val in serie["serie"].items():
+
+                                if val == "-" or val is None:
+                                    continue
+
+                                reference_date = datetime.strptime(ref, "%Y%m").date()
+                                value = float(val.replace(",", "."))
+
+                                cursor.execute("""
+                                    INSERT INTO staging.f_indicator_value
+                                    (indicator_id, reference_date, value)
+                                    VALUES (%s, %s, %s)
+                                    ON CONFLICT (indicator_id, reference_date)
+                                    DO UPDATE SET value = EXCLUDED.value
+                                """, (indicator_id, reference_date, value))
+
+
+
+
+            # ==========================================================
+            # BCB
+            # ==========================================================
+
+            elif "sgs" in file:
+
+                variable_code = None
+                parts = file.split("_")
+
+                for part in parts:
+                    if part.startswith("sgs"):
+                        variable_code = part.replace("sgs", "")
+                        break
+
+                if not variable_code:
+                    logging.warning(f"Variable_code BCB não encontrado em {file}")
+                    continue
+
+                cursor.execute("""
+                    SELECT id
+                    FROM staging.d_indicator_metadata
+                    WHERE variable_code = %s
+                """, (variable_code,))
+
+                result = cursor.fetchone()
+
+                if not result:
+                    logging.warning(f"Metadata não encontrado BCB {variable_code}")
+                    continue
+
+                indicator_id = result[0]
+
+                for row in data:
+
+                    reference_date = datetime.strptime(row["data"], "%d/%m/%Y").date()
+                    value = float(row["valor"].replace(",", "."))
+
+                    cursor.execute("""
+                        INSERT INTO staging.f_indicator_value
+                        (indicator_id, reference_date, value)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (indicator_id, reference_date)
+                        DO UPDATE SET value = EXCLUDED.value
+                    """, (indicator_id, reference_date, value))
+
+    # -------------------------------------------------
+    # Commit fora do loop (IMPORTANTE)
+    # -------------------------------------------------
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    logging.info("Processamento finalizado com sucesso.")
+
+
+
 with DAG(
     dag_id="api_ingestion_raw",
     start_date=datetime(2026, 1, 22),
@@ -176,3 +389,10 @@ with DAG(
         task_id="extract_api_raw",
         python_callable=extract_api_raw
     )
+
+    process_task = PythonOperator(
+    task_id="process_raw_indicator_files",
+    python_callable=process_raw_indicator_files
+)
+
+extract_raw >> process_task
